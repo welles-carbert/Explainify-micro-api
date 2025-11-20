@@ -5,7 +5,7 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Load environment variables from .env
+# Load environment variables
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -16,13 +16,15 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-app = FastAPI(title="Explainify API", version="0.1.0")
+app = FastAPI(title="Explainify API", version="0.2.0")
 
+# Allowed complexity levels
+VALID_LEVELS = {"beginner", "intermediate", "advanced"}
 
+# Request + Response Models
 class ExplainRequest(BaseModel):
     text: str
-    level: str = "intermediate"  # beginner | intermediate | advanced
-
+    level: str = "intermediate"
 
 class ExplainResponse(BaseModel):
     level: str
@@ -31,14 +33,11 @@ class ExplainResponse(BaseModel):
     key_points: List[str]
 
 
-def verify_api_key(x_api_key: Optional[str]) -> None:
-    """
-    Simple API key check. In prod, you'd store keys in a DB.
-    """
+# Internal API Key Verification
+def verify_api_key(x_api_key: Optional[str]):
     if INTERNAL_API_KEY is None:
-        # No auth configured -> allow all (dev mode)
-        return
-    if x_api_key is None or x_api_key != INTERNAL_API_KEY:
+        return  # dev mode
+    if x_api_key != INTERNAL_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
@@ -49,52 +48,62 @@ def health():
 
 @app.post("/explain", response_model=ExplainResponse)
 def explain(req: ExplainRequest, x_api_key: Optional[str] = Header(default=None)):
-    """
-    Take input text and explain it at the requested level.
-    """
+
+    # Validate key
     verify_api_key(x_api_key)
 
-    level = req.level.lower()
-    if level not in {"beginner", "intermediate", "advanced"}:
-        level = "intermediate"
+    # Validate text
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
 
+    # Validate level
+    level = req.level.lower()
+    if level not in VALID_LEVELS:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid level. Choose: beginner, intermediate, or advanced."
+        )
+
+    # Level instructions for LLM
     level_instructions = {
         "beginner": (
-            "Explain this as if to a smart 12-year-old with no background. "
+            "Explain this as if to a smart 12-year-old. "
             "Use simple language and short sentences."
         ),
         "intermediate": (
-            "Explain this to a college student who knows basics but not deep details. "
-            "Be clear, structured, and avoid jargon unless you define it."
+            "Explain this to a college student. "
+            "Be structured, clear, and reduce jargon."
         ),
         "advanced": (
-            "Explain this to someone with domain familiarity. "
-            "You can use technical terms but stay concise and precise."
+            "Explain this to someone with strong domain familiarity. "
+            "Use technical detail but stay concise."
         ),
     }
 
     system_prompt = (
-        "You are an explainer AI. You:\n"
-        "- Read the user's text.\n"
-        "- Create a 2–3 sentence summary.\n"
-        "- Then a clear explanation at the requested level.\n"
-        "- Then 3–7 bullet key points.\n"
-        "Be accurate and avoid making up facts."
+        "You are an expert explanation engine.\n"
+        "Follow this structure strictly:\n\n"
+        "SUMMARY:\n"
+        "A 2–3 sentence summary.\n\n"
+        "EXPLANATION:\n"
+        "A deeper explanation adapted to the requested complexity level.\n\n"
+        "KEY POINTS:\n"
+        "- bullet 1\n"
+        "- bullet 2\n"
+        "- bullet 3\n\n"
+        "Be accurate and avoid hallucinations."
     )
 
     user_prompt = (
         f"{level_instructions[level]}\n\n"
         f"Text:\n{req.text}\n\n"
-        "Return your answer in this format:\n"
-        "SUMMARY:\n...\n\n"
-        "EXPLANATION:\n...\n\n"
-        "KEY POINTS:\n"
-        "- point 1\n- point 2\n- point 3"
+        "Return EXACTLY using the structure provided."
     )
 
+    # Call LLM
     try:
         completion = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o-mini",   # changed from gpt-5.1-mini
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -106,47 +115,49 @@ def explain(req: ExplainRequest, x_api_key: Optional[str] = Header(default=None)
 
     content = completion.choices[0].message.content or ""
 
-    # Very rough parsing. We'll clean this up later.
-    summary = ""
-    explanation = ""
-    key_points: List[str] = []
+    # Clean and parse
+    content = content.replace("\r", "")
+    sections = {"summary": "", "explanation": "", "keypoints": []}
+    current = None
 
-    section = None
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped.upper().startswith("SUMMARY"):
-            section = "summary"
-            continue
-        if stripped.upper().startswith("EXPLANATION"):
-            section = "explanation"
-            continue
-        if stripped.upper().startswith("KEY POINTS"):
-            section = "keypoints"
-            continue
+    for line in content.split("\n"):
+        l = line.strip()
 
-        if not stripped:
+        if l.upper().startswith("SUMMARY"):
+            current = "summary"
+            continue
+        if l.upper().startswith("EXPLANATION"):
+            current = "explanation"
+            continue
+        if l.upper().startswith("KEY POINTS"):
+            current = "keypoints"
             continue
 
-        if section == "summary":
-            summary += stripped + " "
-        elif section == "explanation":
-            explanation += stripped + " "
-        elif section == "keypoints":
-            if stripped.startswith("-"):
-                key_points.append(stripped.lstrip("- ").strip())
+        if current == "summary":
+            if l:
+                sections["summary"] += l + " "
+        elif current == "explanation":
+            if l:
+                sections["explanation"] += l + " "
+        elif current == "keypoints":
+            if l.startswith("-"):
+                sections["keypoints"].append(l[1:].strip())
 
-    summary = summary.strip()
-    explanation = explanation.strip()
+    # Safe fallbacks
+    if not sections["summary"].strip():
+        sections["summary"] = "Summary unavailable."
 
-    if not summary:
-        summary = explanation[:200] + "..." if explanation else "No summary generated."
-    if not key_points:
-        key_points = ["No key points parsed."]
+    if not sections["explanation"].strip():
+        sections["explanation"] = "Explanation unavailable."
 
+    if not sections["keypoints"]:
+        sections["keypoints"] = ["No key points available."]
+
+    # Final structured response
     return ExplainResponse(
         level=level,
-        summary=summary,
-        explanation=explanation,
-        key_points=key_points,
+        summary=sections["summary"].strip(),
+        explanation=sections["explanation"].strip(),
+        key_points=sections["keypoints"],
     )
-    
+
